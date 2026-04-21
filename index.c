@@ -24,6 +24,8 @@
 #include <unistd.h>
 #include <dirent.h>
 
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
 // Find an index entry by path (linear scan).
@@ -107,7 +109,7 @@ int index_status(const Index *index) {
                     break;
                 }
             }
-            
+
             if (!is_tracked) {
                 struct stat st;
                 stat(ent->d_name, &st);
@@ -135,12 +137,29 @@ int index_status(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_load(Index *index) {
-    // TODO: Implement index loading
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
-}
+    index->count = 0;
+    FILE *f = fopen(INDEX_FILE, "r");
+    if (!f) return 0;  // No index yet — not an error
 
+    while (index->count < MAX_INDEX_ENTRIES) {
+        IndexEntry *e = &index->entries[index->count];
+        char hex[HASH_HEX_SIZE + 1];
+        unsigned long long mtime_tmp;
+        unsigned int size_tmp;
+
+        int n = fscanf(f, "%o %64s %llu %u %511s\n",
+                       &e->mode, hex, &mtime_tmp, &size_tmp, e->path);
+        if (n != 5) break;
+
+        e->mtime_sec = (uint64_t)mtime_tmp;
+        e->size = (uint32_t)size_tmp;
+
+        if (hex_to_hash(hex, &e->hash) != 0) { fclose(f); return -1; }
+        index->count++;
+    }
+    fclose(f);
+    return 0;
+}
 // Save the index to .pes/index atomically.
 //
 // HINTS - Useful functions and syscalls:
@@ -151,11 +170,38 @@ int index_load(Index *index) {
 //   - rename                           : atomically moving the temp file over the old index
 //
 // Returns 0 on success, -1 on error.
+static int compare_index_entries(const void *a, const void *b) {
+    return strcmp(((const IndexEntry *)a)->path, ((const IndexEntry *)b)->path);
+}
+
 int index_save(const Index *index) {
-    // TODO: Implement atomic index saving
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+    Index *sorted = malloc(sizeof(Index));
+    if (!sorted) return -1;
+    *sorted = *index;
+    qsort(sorted->entries, sorted->count, sizeof(IndexEntry), compare_index_entries);
+
+    char tmp_path[] = ".pes/index_tmp_XXXXXX";
+    int fd = mkstemp(tmp_path);
+    if (fd < 0) { free(sorted); return -1; }
+
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(tmp_path); free(sorted); return -1; }
+
+    for (int i = 0; i < sorted->count; i++) {
+        char hex[HASH_HEX_SIZE + 1];
+        hash_to_hex(&sorted->entries[i].hash, hex);
+        fprintf(f, "%o %s %llu %u %s\n",
+                sorted->entries[i].mode, hex,
+                (unsigned long long)sorted->entries[i].mtime_sec,
+                sorted->entries[i].size,
+                sorted->entries[i].path);
+    }
+
+    fflush(f); fsync(fileno(f)); fclose(f);
+    free(sorted);
+
+    if (rename(tmp_path, INDEX_FILE) != 0) { unlink(tmp_path); return -1; }
+    return 0;
 }
 
 // Stage a file for the next commit.
@@ -172,4 +218,38 @@ int index_add(Index *index, const char *path) {
     // (See Lab Appendix for logical steps)
     (void)index; (void)path;
     return -1;
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "error: cannot open '%s'\n", path); return -1; }
+
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    void *data = malloc(file_size > 0 ? file_size : 1);
+    if (!data) { fclose(f); return -1; }
+
+    size_t read_len = fread(data, 1, file_size, f);
+    fclose(f);
+
+    ObjectID hash;
+    if (object_write(OBJ_BLOB, data, read_len, &hash) != 0) { free(data); return -1; }
+    free(data);
+
+    struct stat st;
+    if (lstat(path, &st) != 0) return -1;
+
+    IndexEntry *existing = index_find(index, path);
+    if (!existing) {
+        if (index->count >= MAX_INDEX_ENTRIES) return -1;
+        existing = &index->entries[index->count++];
+    }
+
+    existing->mode = (st.st_mode & S_IXUSR) ? 0100755 : 0100644;
+    existing->hash = hash;
+    existing->mtime_sec = (uint64_t)st.st_mtime;
+    existing->size = (uint32_t)st.st_size;
+    strncpy(existing->path, path, sizeof(existing->path) - 1);
+    existing->path[sizeof(existing->path) - 1] = '\0';
+
+    return index_save(index);
 }
