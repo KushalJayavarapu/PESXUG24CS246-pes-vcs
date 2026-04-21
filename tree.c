@@ -101,11 +101,11 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
     size_t offset = 0;
     for (int i = 0; i < sorted_tree.count; i++) {
         const TreeEntry *entry = &sorted_tree.entries[i];
-        
+
         // Write mode and name (%o writes octal correctly for Git standards)
         int written = sprintf((char *)buffer + offset, "%o %s", entry->mode, entry->name);
         offset += written + 1; // +1 to step over the null terminator written by sprintf
-        
+
         // Write binary hash
         memcpy(buffer + offset, entry->hash.hash, HASH_SIZE);
         offset += HASH_SIZE;
@@ -218,37 +218,25 @@ static int write_tree_level(IndexEntry **entries, int count, int depth, ObjectID
 
 int tree_from_index(ObjectID *id_out) {
     Index index;
+
     if (index_load(&index) != 0) return -1;
+    if (index.count == 0) return -1;
 
-    if (index.count == 0) {
-        Tree t;
-        t.count = 0;
+    char buffer[1024];
+    int offset = 0;
 
-        void *data;
-        size_t len;
+    for (int i = 0; i < index.count; i++) {
+        char hex[65];
 
-        if (tree_serialize(&t, &data, &len) != 0)
-            return -1;
+        hash_to_hex(&index.entries[i].hash, hex);
 
-        int ret = object_write(OBJ_TREE, data, len, id_out);
-        free(data);
-        return ret;
+        offset += snprintf(buffer + offset,
+                           sizeof(buffer) - offset,
+                           "%o blob %s %s\n",
+                           index.entries[i].mode,
+                           hex,
+                           index.entries[i].path);
     }
 
-    // sort
-    for (int i = 0; i < index.count - 1; i++) {
-        for (int j = i + 1; j < index.count; j++) {
-            if (strcmp(index.entries[i].path, index.entries[j].path) > 0) {
-                IndexEntry tmp = index.entries[i];
-                index.entries[i] = index.entries[j];
-                index.entries[j] = tmp;
-            }
-        }
-    }
-
-    IndexEntry *ptrs[MAX_INDEX_ENTRIES];
-    for (int i = 0; i < index.count; i++)
-        ptrs[i] = &index.entries[i];
-
-    return write_tree_level(ptrs, index.count, 0, id_out);
+    return object_write(OBJ_TREE, buffer, offset, id_out);
 }
